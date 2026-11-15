@@ -124,12 +124,16 @@
         <input id="r-part" placeholder="分区 2026-11-13 或 2026-11-13T08" style="width:210px">
         <select id="r-status"><option value="success">success</option><option value="failed">failed</option></select>
         <label>版本 <input id="r-ver" type="number" min="1" value="1" style="width:64px"></label>
+        <input id="r-time" placeholder="完成时间 可带时区 如 2026-11-14T01:00:00+08:00" style="width:300px">
         <button onclick="addRecord()">录入</button>
       </div>
       <table>
         <thead><tr><th>任务</th><th>分区</th><th>状态</th><th>记录版本</th><th>当前版本</th><th>完成时间</th><th></th></tr></thead>
         <tbody id="record-rows"></tbody>
       </table>
+      <p class="hint">完成时间留空取当前时间；可带时区偏移（<code>+08:00</code>）或 <code>Z</code>。
+        同一分区的多条记录：带时区时间按实际时刻判定最新（同时刻以记录号定先后）；无时区时间沿用原有顺序；
+        两者混用或时间无法解析 → 生成计划被拒绝并指出分区。非法完成时间无法入库。</p>
       <p class="hint">记录版本 &lt; 当前版本 → 该分区前置「版本过期」；记录版本 &gt; 当前版本或分区格式与粒度不符 → 生成计划时被拒绝。</p>
     </div>
   </section>
@@ -143,7 +147,8 @@
         <label>业务日期 <input id="p-date" type="date" value="2026-11-13"></label>
         <button onclick="generatePlan()">生成计划</button>
       </div>
-      <p class="hint">小时级目标任务将覆盖该业务日全部 24 个小时分区。依赖成环或记录与当前配置不一致时拒绝生成（留痕于计划列表）。</p>
+      <p class="hint">小时级目标任务将覆盖该业务日全部 24 个小时分区。依赖成环、记录与当前配置不一致、
+        同分区记录混用带时区/无时区时间或完成时间无法解析时拒绝生成（留痕于计划列表）。</p>
     </div>
     <div id="plan-result"></div>
   </section>
@@ -272,10 +277,13 @@ function renderRecords() {
 }
 async function addRecord() {
   try {
-    await post('/api/records', {task_id: +$('#r-task').value,
+    const body = {task_id: +$('#r-task').value,
       partition: $('#r-part').value.trim(), status: $('#r-status').value,
-      config_version: +$('#r-ver').value || 1});
-    $('#r-part').value = '';
+      config_version: +$('#r-ver').value || 1};
+    const ft = $('#r-time').value.trim();
+    if (ft) body.finished_at = ft;
+    await post('/api/records', body);
+    $('#r-part').value = ''; $('#r-time').value = '';
     showMsg('记录已录入'); refresh();
   } catch (e) { showMsg(e.body, true); }
 }

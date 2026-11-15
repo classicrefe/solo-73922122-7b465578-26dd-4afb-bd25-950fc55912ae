@@ -18,6 +18,14 @@
   - failed  : 最新运行记录为 failed
   - stale   : 最新记录为 success 但记录版本 < 任务当前配置版本（版本过期）
 
+最新记录判定（同一 任务+分区 的多条记录）:
+  完成时间分两类：带时区偏移（如 2026-11-14T01:00:00+08:00 / ...Z）与无时区
+  （如 2026-11-14T01:00:00）。
+  - 同分区记录均为带时区时间：按实际时刻排序，同时刻以记录号(id)定先后
+  - 同分区记录均为无时区时间：沿用原有顺序（按字符串比较，再按记录号）
+  - 同分区记录混用两类时间：拒绝生成（不猜测时区）
+  - 完成时间无法解析：拒绝生成
+
 展开规则（只展开必要的上游）:
   从目标分区出发 BFS；状态为 ok 的分区视为已满足，标记 skip 并停止向上展开；
   其余分区标记 backfill 并继续展开其上游。
@@ -25,15 +33,21 @@
 拒绝生成:
   - 依赖在可达子图内成环
   - 可达任务的运行记录与当前配置不一致（分区格式与粒度不符 / 记录版本高于当前配置版本）
+  - 可达任务的运行记录完成时间无法解析，或同一 任务+分区 的记录混用两类时间
   - 展开规模超过安全上限
 """
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 DAILY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 HOURLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[0-2]\d$")
+
+# 完成时间：YYYY-MM-DDTHH:MM[:SS[.ffffff]]，可带 Z 或 ±HH:MM 时区偏移
+TS_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?"
+    r"(Z|[+-]\d{2}:\d{2})?$")
 
 MAX_EXPAND = 5000  # 展开分区数安全上限
 
@@ -69,6 +83,28 @@ def parse_partition(partition: str):
 def partition_matches(granularity: str, partition: str) -> bool:
     p = parse_partition(partition)
     return bool(p) and p[0] == granularity
+
+
+def parse_finished_at(ts):
+    """解析完成时间。
+
+    返回 ("aware", datetime)（带时区偏移/Z）或 ("naive", datetime)（无时区）；
+    无法解析返回 None。不猜测时区：naive 就是 naive，不补默认偏移。
+    """
+    if not isinstance(ts, str):
+        return None
+    text = ts.strip()
+    if not TS_RE.match(text):
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.utcoffset() is not None:
+        return ("aware", dt)
+    return ("naive", dt)
 
 
 def shift_partitions(up_granularity: str, down_granularity: str,
@@ -197,13 +233,50 @@ def build_plan(tasks: list[dict], deps: list[dict], records: list[dict],
         more = f" 等{len(problems)}处" if len(problems) > 5 else ""
         return _reject(f"运行记录与当前配置不一致，拒绝生成: {shown}{more}", snapshot)
 
-    # 每个 (任务, 分区) 的最新记录（按完成时间、再按 id）
-    latest: dict[tuple[int, str], dict] = {}
+    # 3) 同任务同分区的最新记录判定：
+    #    带时区时间按实际时刻排序（同时刻以记录号定先后）；
+    #    无时区时间之间沿用原有顺序（字符串比较，再按记录号）；
+    #    同分区混用两类时间或时间无法解析 -> 拒绝生成并指出分区
+    groups: dict[tuple[int, str], list[dict]] = {}
     for r in records:
-        key = (r["task_id"], r["partition"])
-        cur = latest.get(key)
-        if cur is None or (r["finished_at"], r["id"]) > (cur["finished_at"], cur["id"]):
-            latest[key] = r
+        if r["task_id"] not in reachable:
+            continue
+        groups.setdefault((r["task_id"], r["partition"]), []).append(r)
+
+    latest: dict[tuple[int, str], dict] = {}
+    time_problems = []
+    for (tid, part), group in groups.items():
+        tname = task_by_id[tid]["name"]
+        parsed = []
+        bad = False
+        for r in group:
+            p = parse_finished_at(r["finished_at"])
+            if p is None:
+                time_problems.append(
+                    f"记录#{r['id']} 任务[{tname}] 分区[{part}] "
+                    f"完成时间无法解析: {r['finished_at']!r}")
+                bad = True
+            else:
+                parsed.append((p[0], p[1], r))
+        if bad:
+            continue
+        kinds = {k for k, _, _ in parsed}
+        if len(kinds) > 1:
+            time_problems.append(
+                f"任务[{tname}] 分区[{part}] 的运行记录混用带时区与无时区时间，"
+                f"无法判定最新记录（不猜测时区）")
+            continue
+        if kinds == {"aware"}:
+            latest[(tid, part)] = max(
+                parsed,
+                key=lambda x: (x[1].astimezone(timezone.utc), x[2]["id"]))[2]
+        else:
+            latest[(tid, part)] = max(
+                parsed, key=lambda x: (x[2]["finished_at"], x[2]["id"]))[2]
+    if time_problems:
+        shown = "；".join(time_problems[:5])
+        more = f" 等{len(time_problems)}处" if len(time_problems) > 5 else ""
+        return _reject(f"运行记录完成时间异常，拒绝生成: {shown}{more}", snapshot)
 
     def status_of(task: dict, partition: str) -> str:
         r = latest.get((task["id"], partition))
@@ -215,7 +288,7 @@ def build_plan(tasks: list[dict], deps: list[dict], records: list[dict],
             return "stale"
         return "ok"
 
-    # 3) 从目标分区出发，只展开必要的上游
+    # 4) 从目标分区出发，只展开必要的上游
     biz = date.fromisoformat(biz_date)
     if target["granularity"] == "daily":
         target_parts = [biz.isoformat()]
@@ -257,7 +330,7 @@ def build_plan(tasks: list[dict], deps: list[dict], records: list[dict],
                 edges[key].add(up_key)
                 queue.append((up["id"], up_part))
 
-    # 4) 拓扑波次（仅对待回填节点排序；skip 节点视为已就绪）
+    # 5) 拓扑波次（仅对待回填节点排序；skip 节点视为已就绪）
     backfill_keys = {k for k, it in items.items() if it["action"] == "backfill"}
     ups_of = {k: sorted(u for u in edges.get(k, ()) if u in backfill_keys)
               for k in backfill_keys}

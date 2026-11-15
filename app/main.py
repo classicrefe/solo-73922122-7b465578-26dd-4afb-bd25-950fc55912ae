@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .db import get_conn, init_db, rows
-from .planner import build_plan, parse_partition
+from .planner import build_plan, parse_finished_at, parse_partition
 from .seed import seed_if_empty
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -174,7 +174,16 @@ def create_record(body: RecordIn):
     if not parsed:
         raise HTTPException(
             400, "非法分区格式（日: YYYY-MM-DD，小时: YYYY-MM-DDTHH）")
-    finished_at = body.finished_at or datetime.now().isoformat(timespec="seconds")
+    if body.finished_at and body.finished_at.strip():
+        parsed_ts = parse_finished_at(body.finished_at)
+        if parsed_ts is None:
+            # 非法完成时间不入库，避免后续计划无法判定最新记录
+            raise HTTPException(
+                400, "非法完成时间（应为 YYYY-MM-DDTHH:MM[:SS]，"
+                     "可带时区偏移如 +08:00 或 Z；留空取当前时间）")
+        finished_at = parsed_ts[1].isoformat()  # 规范化存储
+    else:
+        finished_at = datetime.now().isoformat(timespec="seconds")
     with get_conn() as conn:
         task = conn.execute("SELECT * FROM tasks WHERE id = ?",
                             (body.task_id,)).fetchone()

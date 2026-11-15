@@ -1,7 +1,8 @@
 """规划器单元测试：python -m unittest discover tests -v"""
 import unittest
 
-from app.planner import build_plan, partition_matches, shift_partitions
+from app.planner import (build_plan, parse_finished_at, partition_matches,
+                         shift_partitions)
 
 
 def T(tid, name, gran="daily", ver=1):
@@ -37,6 +38,119 @@ class TestShift(unittest.TestCase):
         self.assertTrue(partition_matches("hourly", "2026-11-13T08"))
         self.assertFalse(partition_matches("daily", "2026-11-13T08"))
         self.assertFalse(partition_matches("hourly", "2026-13-01"))
+
+
+class TestParseFinishedAt(unittest.TestCase):
+    def test_naive(self):
+        kind, dt = parse_finished_at("2026-11-14T01:00:00")
+        self.assertEqual(kind, "naive")
+        self.assertEqual(dt.isoformat(), "2026-11-14T01:00:00")
+
+    def test_aware_offset(self):
+        kind, dt = parse_finished_at("2026-11-14T01:00:00+08:00")
+        self.assertEqual(kind, "aware")
+        self.assertEqual(dt.utcoffset().total_seconds(), 8 * 3600)
+
+    def test_aware_z(self):
+        kind, dt = parse_finished_at("2026-11-14T01:00:00Z")
+        self.assertEqual(kind, "aware")
+        self.assertEqual(dt.utcoffset().total_seconds(), 0)
+
+    def test_minutes_and_fraction_ok(self):
+        self.assertIsNotNone(parse_finished_at("2026-11-14T01:02"))
+        self.assertIsNotNone(parse_finished_at("2026-11-14T01:02:03.123456"))
+
+    def test_invalid(self):
+        for bad in ("2026-11-14", "2026-11-14 01:00:00", "2026-13-14T01:00:00",
+                    "2026-11-14T25:00:00", "2026-11-14T01:00:00+0800",
+                    "昨天下午", "", None, 123):
+            self.assertIsNone(parse_finished_at(bad), repr(bad))
+
+
+class TestLatestByFinishedAt(unittest.TestCase):
+    """同任务同分区的最新记录判定：时区感知排序 + 混用/坏时间拒绝。"""
+
+    def setUp(self):
+        # a(daily) <- b(daily, off1)：a@11-13 依赖 b@11-12
+        self.tasks = [T(1, "a"), T(2, "b")]
+        self.deps = [D(1, 1, 2, 1)]
+
+    def plan(self, records, deps=None):
+        return build_plan(self.tasks, deps or self.deps, records, 1,
+                          "2026-11-13", now="2026-11-14T09:00:00")
+
+    def status_of_b(self, p, part="2026-11-12"):
+        return next(i for i in p["items"]
+                    if i["key"] == f"b:{part}")["status"]
+
+    def test_aware_compared_by_absolute_instant(self):
+        # 字符串上 success 更晚，但实际时刻 failed 更晚 -> failed 才是最新
+        recs = [
+            R(1, 2, "2026-11-12", status="success",
+              ts="2026-11-14T10:00:00+08:00"),  # = 2026-11-14T02:00:00Z
+            R(2, 2, "2026-11-12", status="failed",
+              ts="2026-11-14T03:00:00+00:00"),  # = 2026-11-14T03:00:00Z
+        ]
+        p = self.plan(recs)
+        self.assertEqual(p["status"], "generated")
+        self.assertEqual(self.status_of_b(p), "failed")
+
+    def test_aware_same_instant_higher_id_wins(self):
+        # 不同时区表示的同一时刻 -> 记录号大者为最新
+        recs = [
+            R(1, 2, "2026-11-12", status="success",
+              ts="2026-11-14T10:00:00+08:00"),  # = 2026-11-14T02:00:00Z
+            R(2, 2, "2026-11-12", status="failed",
+              ts="2026-11-14T02:00:00Z"),       # 同一时刻，id 更大
+        ]
+        p = self.plan(recs)
+        self.assertEqual(self.status_of_b(p), "failed")
+
+    def test_naive_keeps_legacy_order(self):
+        # 无时区时间之间沿用原有（字符串）顺序
+        recs = [
+            R(1, 2, "2026-11-12", status="failed", ts="2026-11-14T01:00:00"),
+            R(2, 2, "2026-11-12", status="success", ts="2026-11-14T02:00:00"),
+        ]
+        p = self.plan(recs)
+        self.assertEqual(self.status_of_b(p), "ok")
+
+    def test_mixed_kinds_rejected_with_partition(self):
+        recs = [
+            R(1, 2, "2026-11-12", status="success", ts="2026-11-14T01:00:00"),
+            R(2, 2, "2026-11-12", status="failed",
+              ts="2026-11-14T02:00:00+08:00"),
+        ]
+        p = self.plan(recs)
+        self.assertEqual(p["status"], "rejected")
+        self.assertIn("混用", p["reject_reason"])
+        self.assertIn("2026-11-12", p["reject_reason"])  # 指出分区
+
+    def test_unparseable_rejected_with_partition(self):
+        recs = [R(1, 2, "2026-11-12", ts="昨天下午")]
+        p = self.plan(recs)
+        self.assertEqual(p["status"], "rejected")
+        self.assertIn("无法解析", p["reject_reason"])
+        self.assertIn("2026-11-12", p["reject_reason"])  # 指出分区
+
+    def test_different_partitions_may_use_different_kinds(self):
+        # 混用判定以 任务+分区 为界：不同分区各自用一类时间，不拒绝
+        deps = [D(1, 1, 2, 0)]  # a@11-13 依赖 b@11-13
+        recs = [
+            R(1, 2, "2026-11-13", status="success", ts="2026-11-14T01:00:00"),
+            R(2, 2, "2026-11-12", status="success",
+              ts="2026-11-14T01:00:00+08:00"),
+        ]
+        p = self.plan(recs, deps=deps)
+        self.assertEqual(p["status"], "generated")
+        self.assertEqual(self.status_of_b(p, "2026-11-13"), "ok")
+
+    def test_unreachable_bad_time_ignored(self):
+        # 不可达任务的坏时间记录不参与判定
+        self.tasks.append(T(9, "unrelated"))
+        recs = [R(1, 9, "2026-11-12", ts="垃圾时间")]
+        p = self.plan(recs)
+        self.assertEqual(p["status"], "generated")
 
 
 class TestBuildPlan(unittest.TestCase):
